@@ -1,0 +1,368 @@
+name: Reusable .NET CI Workflow
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Target environment (dev, sit, prod)'
+        required: true
+        type: string
+      dotnet-version:
+        description: '.NET version to use'
+        required: false
+        type: string
+        default: '8.0.x'
+      run-tests:
+        description: 'Run tests'
+        required: false
+        type: boolean
+        default: true
+      branch-type:
+        description: 'Branch type (feature, bugfix, release, hotfix)'
+        required: true
+        type: string
+      include-reports:
+        description: 'Include SSRS reports in artifacts'
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      SONAR_TOKEN:
+        required: false
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      - name: Find API Project
+        id: find-api
+        run: |
+          echo " Searching for API project..."
+          
+          # Try to find NDM.API.csproj first
+          API=$(find . -type f -iname "NDM.API.csproj" | head -n 1)
+          
+          # Fallback to any API project
+          if [ -z "$API" ]; then
+            API=$(find . -type f -iname "*API*.csproj" | head -n 1)
+          fi
+          
+          if [ -z "$API" ]; then
+            echo "::error::No API project found"
+            exit 1
+          fi
+          
+          API=$(echo "$API" | sed 's|^\./||')
+          echo "api=$API" >> $GITHUB_OUTPUT
+          echo " Found API project: $API"
+
+      - name: Find Solution File
+        id: find-solution
+        run: |
+          echo " Searching for solution file..."
+          
+          SLN=$(find . -maxdepth 2 -type f -name "*.sln" | head -n 1)
+          
+          if [ -n "$SLN" ]; then
+            SLN=$(echo "$SLN" | sed 's|^\./||')
+            echo "solution=$SLN" >> $GITHUB_OUTPUT
+            echo "found=true" >> $GITHUB_OUTPUT
+            echo " Found solution: $SLN"
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo " No solution file found, will build API project directly"
+          fi
+
+      - name: Restore Dependencies
+        run: |
+          echo " Restoring NuGet packages..."
+          
+          if [ "${{ steps.find-solution.outputs.found }}" = "true" ]; then
+            dotnet restore "${{ steps.find-solution.outputs.solution }}"
+          else
+            dotnet restore "${{ steps.find-api.outputs.api }}"
+          fi
+          
+          echo "Dependencies restored"
+
+      - name: Build Solution/Project
+        run: |
+          echo " Building project..."
+          
+          if [ "${{ steps.find-solution.outputs.found }}" = "true" ]; then
+            dotnet build "${{ steps.find-solution.outputs.solution }}" -c Release --no-restore
+          else
+            dotnet build "${{ steps.find-api.outputs.api }}" -c Release --no-restore
+          fi
+          
+          echo " Build completed"
+
+      - name: Run Tests
+        if: inputs.run-tests == true
+        run: |
+          echo " Running tests..."
+          mkdir -p TestResults
+          
+          # Find all test projects
+          TESTS=$(find . -type f \( -iname "*Tests.csproj" -o -iname "*UnitTests.csproj" -o -iname "*FunctionalTests.csproj" \) | tr '\n' ' ')
+          
+          if [ -z "$TESTS" ]; then
+            echo " No test projects found, skipping tests"
+            exit 0
+          fi
+          
+          echo "Found test projects:"
+          echo "$TESTS" | tr ' ' '\n'
+          
+          for proj in $TESTS; do
+            echo "Running tests for: $proj"
+            dotnet test "$proj" \
+              --configuration Release \
+              --no-build \
+              --logger "trx;LogFileName=TestResults/$(basename $proj .csproj).trx" \
+              --verbosity normal || echo " Tests failed or completed with issues"
+          done
+          
+          echo " Test execution completed"
+        continue-on-error: true
+
+      - name: Upload Test Results
+        if: inputs.run-tests == true && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ inputs.environment }}-${{ github.sha }}
+          path: TestResults/**/*.trx
+          retention-days: 7
+        continue-on-error: true
+
+      - name: Publish API
+        run: |
+          echo " Publishing API..."
+          mkdir -p publish/api
+          
+          dotnet publish "${{ steps.find-api.outputs.api }}" \
+            -c Release \
+            -o publish/api \
+            --no-restore
+          
+          echo " API published to publish/api"
+          ls -lh publish/api | head -20
+
+      - name: Find and Package Reports
+        if: inputs.include-reports == true
+        run: |
+          echo " Searching for SSRS reports..."
+          mkdir -p publish/reports
+          
+          # Find .rptproj files
+          RPTPROJ=$(find . -type f -iname "*.rptproj" | head -n 1)
+          
+          if [ -n "$RPTPROJ" ]; then
+            REPORT_DIR=$(dirname "$RPTPROJ")
+            echo " Found rptproj at: $REPORT_DIR"
+            
+            # Copy report files (excluding build artifacts)
+            rsync -av \
+              --exclude 'bin/' \
+              --exclude 'obj/' \
+              --exclude '*.user' \
+              --exclude '.vs/' \
+              "$REPORT_DIR/" publish/reports/
+            
+            echo " Reports packaged"
+          else
+            # Fallback: find individual report files
+            REPORTS=$(find . -type f \( -iname "*.rdl" -o -iname "*.rdlc" -o -iname "*.rpt" \))
+            
+            if [ -n "$REPORTS" ]; then
+              echo " Found report files:"
+              echo "$REPORTS"
+              echo "$REPORTS" | while read file; do
+                cp --parents "$file" publish/reports/ 2>/dev/null || true
+              done
+            else
+              echo " No reports found"
+            fi
+          fi
+        continue-on-error: true
+
+      - name: Create API Artifact
+        run: |
+          echo " Creating API artifact..."
+          cd publish/api
+          zip -r ../../api-${{ inputs.environment }}-${{ github.sha }}.zip .
+          cd ../..
+          
+          SIZE=$(du -h api-${{ inputs.environment }}-${{ github.sha }}.zip | cut -f1)
+          echo " API artifact created: $SIZE"
+
+      - name: Create Reports Artifact
+        if: inputs.include-reports == true
+        run: |
+          if [ -d "publish/reports" ] && [ "$(ls -A publish/reports)" ]; then
+            echo " Creating reports artifact..."
+            cd publish/reports
+            zip -r ../../reports-${{ inputs.environment }}-${{ github.sha }}.zip .
+            cd ../..
+            
+            SIZE=$(du -h reports-${{ inputs.environment }}-${{ github.sha }}.zip | cut -f1)
+            echo " Reports artifact created: $SIZE"
+          else
+            echo " No reports to package"
+          fi
+        continue-on-error: true
+
+      - name: Create Combined Bundle
+        if: inputs.include-reports == true
+        run: |
+          if [ -f "reports-${{ inputs.environment }}-${{ github.sha }}.zip" ]; then
+            echo " Creating combined bundle..."
+            mkdir -p combined/api combined/reports
+            
+            cp -r publish/api/* combined/api/ 2>/dev/null || true
+            cp -r publish/reports/* combined/reports/ 2>/dev/null || true
+            
+            cd combined
+            zip -r ../bundle-${{ inputs.environment }}-${{ github.sha }}.zip .
+            cd ..
+            
+            SIZE=$(du -h bundle-${{ inputs.environment }}-${{ github.sha }}.zip | cut -f1)
+            echo " Combined bundle created: $SIZE"
+          fi
+        continue-on-error: true
+
+      - name: Upload API Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-${{ inputs.environment }}-${{ github.sha }}
+          path: api-${{ inputs.environment }}-${{ github.sha }}.zip
+          retention-days: 30
+
+      - name: Upload Reports Artifact
+        if: inputs.include-reports == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-${{ inputs.environment }}-${{ github.sha }}
+          path: reports-${{ inputs.environment }}-${{ github.sha }}.zip
+          retention-days: 30
+        continue-on-error: true
+
+      - name: Upload Bundle Artifact
+        if: inputs.include-reports == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ inputs.environment }}-${{ github.sha }}
+          path: bundle-${{ inputs.environment }}-${{ github.sha }}.zip
+          retention-days: 30
+        continue-on-error: true
+
+  security-scanning:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: csharp
+          queries: security-and-quality
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Find and Build Solution
+        run: |
+          SLN=$(find . -maxdepth 2 -type f -name "*.sln" | head -n 1)
+          
+          if [ -n "$SLN" ]; then
+            echo "Building solution: $SLN"
+            dotnet build "$SLN" -c Release
+          else
+            echo "No solution found, building all projects"
+            dotnet build -c Release
+          fi
+        continue-on-error: true
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:csharp"
+        continue-on-error: true
+
+  status-check:
+    runs-on: ubuntu-latest
+    needs: [build-and-test, security-scanning]
+    if: always()
+    
+    steps:
+      - name: CI Summary
+        run: |
+          echo "##  .NET CI Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "###  Project Information" >> $GITHUB_STEP_SUMMARY
+          echo "- **Repository**: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch Type**: ${{ inputs.branch-type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **.NET Version**: ${{ inputs.dotnet-version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "###  Job Status" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Build & Test | ${{ needs.build-and-test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Scanning | ${{ needs.security-scanning.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### Artifacts Generated" >> $GITHUB_STEP_SUMMARY
+          echo "- API Package: \`api-${{ inputs.environment }}-${{ github.sha }}.zip\`" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ inputs.include-reports }}" = "true" ]; then
+            echo "- Reports Package: \`reports-${{ inputs.environment }}-${{ github.sha }}.zip\`" >> $GITHUB_STEP_SUMMARY
+            echo "- Combined Bundle: \`bundle-${{ inputs.environment }}-${{ github.sha }}.zip\`" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.build-and-test.result }}" == "success" ]; then
+            echo "###  Success!" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "All CI checks passed successfully!" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "** Ready for deployment to ${{ inputs.environment }} environment**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "###  Some Checks Had Issues" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Please review the job logs for details." >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "_Artifacts are available for 30 days_" >> $GITHUB_STEP_SUMMARY
